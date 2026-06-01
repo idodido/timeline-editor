@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude context *)",
+      "Bash(Select-String -Pattern \"context|mcp\" -i)"
+    ]
+  }
+}
