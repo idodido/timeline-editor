@@ -1,22 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Box, Button, CircularProgress, IconButton, TextField, Typography } from '@mui/material';
-import { Close, Delete, CloudUpload, FormatBold, FormatItalic, FormatUnderlined, FormatListBulleted, FormatListNumbered, KeyboardArrowDown } from '@mui/icons-material';
+import { Delete, CloudUpload, FormatBold, FormatItalic, FormatUnderlined, FormatListBulleted, FormatListNumbered, KeyboardArrowRight, GpsFixed } from '@mui/icons-material';
 import { CuePoint } from './TimelineRuler';
 
-const DARK = {
-  bg: '#1e1e1e',
-  surface: '#2a2a2a',
-  border: '#3a3a3a',
+const D = {
+  bg: 'transparent',
+  border: 'rgba(255,255,255,0.2)',
   text: '#ffffff',
-  textSecondary: '#aaaaaa',
-  inputBg: '#141414',
+  muted: 'rgba(255,255,255,0.5)',
+  inputBg: 'rgba(0,0,0,0.3)',
 };
 
 interface Props {
   initial: Partial<CuePoint> & { startTime: number } | null;
   editingId: string | null;
   saving: boolean;
-  currentTime: number; // seconds
+  currentTime: number;
   pid: string;
   ks: string;
   onSave: (data: { type: 'chapter' | 'slide'; startTime: number; title: string; description: string; tags: string; imageFile: File | null }) => void;
@@ -32,43 +31,44 @@ const msToDisplay = (ms: number) => {
 
 const displayToMs = (v: string): number => {
   const parts = v.split(':').map(Number);
-  let secs = 0;
-  if (parts.length === 2) secs = (parts[0] || 0) * 60 + (parts[1] || 0);
-  else secs = parts[0] || 0;
+  const secs = parts.length === 2 ? (parts[0]||0)*60+(parts[1]||0) : (parts[0]||0);
   return secs * 1000;
 };
 
 const inputSx = {
   '& .MuiInputBase-root': {
-    backgroundColor: DARK.inputBg,
-    color: DARK.text,
-    fontSize: 13,
-    '& fieldset': { borderColor: DARK.border },
-    '&:hover fieldset': { borderColor: '#555' },
+    color: '#fff', backgroundColor: 'rgba(0,0,0,0.3)', fontSize: 14,
+    '& fieldset': { borderColor: 'rgba(255,255,255,0.4)' },
+    '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.6)' },
     '&.Mui-focused fieldset': { borderColor: '#006efa' },
   },
-  '& .MuiInputLabel-root': { color: DARK.textSecondary, fontSize: 13 },
+  '& .MuiInputLabel-root': { color: 'rgba(255,255,255,0.5)', fontSize: 14 },
   '& .MuiInputLabel-root.Mui-focused': { color: '#006efa' },
 };
 
 export const CuePointForm = ({ initial, editingId, saving, currentTime, pid, ks, onSave, onDelete, onCancel }: Props) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [type] = useState<'chapter' | 'slide'>(initial?.type ?? 'chapter');
+  const [type, setType] = useState<'chapter' | 'slide'>(initial?.type ?? 'chapter');
   const [timeStr, setTimeStr] = useState(msToDisplay(initial?.startTime ?? 0));
   const [title, setTitle] = useState(initial?.title ?? '');
   const [description, setDescription] = useState(initial?.description ?? '');
-  const [tags] = useState(initial?.tags ?? '');
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
 
   useEffect(() => {
+    isDirty.current = false; // reset on every open/switch — prevents auto-save on load
+    clearTimeout(autoSaveTimer.current);
+    setType(initial?.type ?? 'chapter');
     setTimeStr(msToDisplay(initial?.startTime ?? 0));
     setTitle(initial?.title ?? '');
     setDescription(initial?.description ?? '');
     setImageFile(null);
     setImagePreview(null);
   }, [initial, editingId]);
+
+  const isDirty = useRef(false);
+  const autoSaveTimer = useRef<any>(null);
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('image/')) return;
@@ -79,141 +79,60 @@ export const CuePointForm = ({ initial, editingId, saving, currentTime, pid, ks,
   }, []);
 
   const useCurrentTime = () => {
-    const m = Math.floor(currentTime / 60);
-    const s = Math.floor(currentTime % 60);
+    const m = Math.floor(currentTime / 60), s = Math.floor(currentTime % 60);
     setTimeStr(`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`);
   };
 
-  const submit = () => onSave({ type, startTime: displayToMs(timeStr), title, description, tags, imageFile });
-
-  // Build existing slide thumbnail URL if we have an assetId
-  const existingThumb = initial?.assetId && pid && ks
-    ? `https://cdnapisec.kaltura.com/p/${pid}/thumbnail/thumb_asset_id/${initial.assetId}/width/300/ks/${ks}`
+  const isSlide = type === 'slide';
+  const existingThumb = initial?.assetId && ks
+    ? `https://cdnapisec.kaltura.com/api_v3/service/thumbAsset/action/serve?thumbAssetId=${initial.assetId}&ks=${encodeURIComponent(ks)}`
     : null;
 
-  const isSlide = type === 'slide';
-  const isChapter = type === 'chapter';
+  const labelSx = { fontSize: 14, fontWeight: 700, color: D.text, mb: 0.75 };
+  const counterSx = { fontSize: 14, color: D.muted };
 
   return (
-    <Box sx={{ backgroundColor: DARK.bg, height: '100%', display: 'flex', flexDirection: 'column', color: DARK.text }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
 
-      {/* Type label row */}
+      {/* Header: timestamp + title + collapse */}
       <Box sx={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        px: 2, py: 1.5, borderBottom: `1px solid ${DARK.border}`,
+        display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.5,
+        borderBottom: `1px solid ${D.border}`, flexShrink: 0,
       }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'default' }}>
-          <Typography sx={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', color: DARK.textSecondary, textTransform: 'uppercase' }}>
-            {type}
-          </Typography>
-          <KeyboardArrowDown sx={{ fontSize: 16, color: DARK.textSecondary }} />
-        </Box>
+        <Typography sx={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, color: D.muted, textTransform: 'uppercase', minWidth: 36, textAlign: 'center' }}>
+          {timeStr}
+        </Typography>
+        <Typography sx={{ flex: 1, fontSize: 14, fontWeight: 700, color: D.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {title || `Untitled ${type}`}
+        </Typography>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-          {editingId && (
-            <IconButton size="small" onClick={() => onDelete(editingId)} sx={{ color: '#ca1c2d', p: 0.5 }}>
-              <Delete sx={{ fontSize: 16 }} />
-            </IconButton>
-          )}
-          <IconButton size="small" onClick={onCancel} sx={{ color: DARK.textSecondary, p: 0.5 }}>
-            <Close sx={{ fontSize: 16 }} />
+          <IconButton size="small" onClick={onCancel} sx={{ color: D.muted, p: 0.5, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '4px' }}>
+            <KeyboardArrowRight sx={{ fontSize: 16 }} />
           </IconButton>
         </Box>
       </Box>
 
-      {/* Scrollable body */}
+      {/* Scrollable form body */}
       <Box sx={{ flex: 1, overflowY: 'auto', p: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
 
-        {/* Timestamp */}
-        <Box>
-          <Typography sx={{ fontSize: 12, color: DARK.textSecondary, mb: 0.75 }}>Timestamp</Typography>
-          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
-            <TextField
-              value={timeStr}
-              onChange={e => setTimeStr(e.target.value)}
-              size="small"
-              sx={{ width: 90, ...inputSx }}
-              inputProps={{ style: { fontVariantNumeric: 'tabular-nums' } }}
-            />
-            <Button
-              size="small"
-              onClick={useCurrentTime}
-              sx={{
-                backgroundColor: '#2a2a2a', color: DARK.text, fontSize: 12, textTransform: 'none',
-                border: `1px solid ${DARK.border}`, px: 1.5, py: 0.5,
-                '&:hover': { backgroundColor: '#333' },
-              }}
-            >
-              Use current time
-            </Button>
-          </Box>
-        </Box>
-
-        {/* Title */}
-        <Box>
-          <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
-            <Typography sx={{ fontSize: 12, color: DARK.textSecondary }}>Title</Typography>
-            <Typography sx={{ fontSize: 11, color: DARK.textSecondary }}>{title.length}/75</Typography>
-          </Box>
-          <TextField
-            value={title}
-            onChange={e => e.target.value.length <= 75 && setTitle(e.target.value)}
-            size="small"
-            fullWidth
-            placeholder={isChapter ? 'Add chapter name' : 'Add slide name'}
-            sx={inputSx}
-          />
-        </Box>
-
-        {/* Summary / Description */}
-        <Box>
-          <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
-            <Typography sx={{ fontSize: 12, color: DARK.textSecondary }}>{isChapter ? 'Summary' : 'Description'}</Typography>
-            <Typography sx={{ fontSize: 11, color: DARK.textSecondary }}>{description.length}/500</Typography>
-          </Box>
-          {/* Formatting toolbar */}
-          <Box sx={{
-            display: 'flex', alignItems: 'center', gap: 0.25,
-            px: 1, py: 0.5,
-            backgroundColor: DARK.inputBg,
-            border: `1px solid ${DARK.border}`,
-            borderBottom: 'none',
-            borderRadius: '4px 4px 0 0',
-          }}>
-            {[FormatBold, FormatItalic, FormatUnderlined, FormatListBulleted, FormatListNumbered].map((Icon, i) => (
-              <IconButton key={i} size="small" sx={{ color: DARK.textSecondary, p: 0.4, '&:hover': { color: DARK.text, backgroundColor: '#333' } }}>
-                <Icon sx={{ fontSize: 15 }} />
-              </IconButton>
-            ))}
-          </Box>
-          <TextField
-            value={description}
-            onChange={e => e.target.value.length <= 500 && setDescription(e.target.value)}
-            multiline
-            rows={4}
-            fullWidth
-            sx={{
-              ...inputSx,
-              '& .MuiInputBase-root': {
-                ...inputSx['& .MuiInputBase-root'],
-                borderRadius: '0 0 4px 4px',
-                alignItems: 'flex-start',
-              },
-            }}
-          />
-        </Box>
-
-        {/* Slide image */}
+        {/* Slide image — first for slides */}
         {isSlide && (
           <Box>
-            <Typography sx={{ fontSize: 12, color: DARK.textSecondary, mb: 0.75 }}>Slide</Typography>
+            <Typography sx={labelSx}>Slide</Typography>
             {(imagePreview || existingThumb) ? (
-              <Box sx={{ position: 'relative' }}>
+              <Box sx={{ position: 'relative', borderRadius: 1, overflow: 'hidden', cursor: 'pointer' }} onClick={() => fileInputRef.current?.click()}>
                 <img
                   src={imagePreview || existingThumb!}
                   alt="slide"
-                  style={{ width: '100%', borderRadius: 6, objectFit: 'cover', cursor: 'pointer', border: `1px solid ${DARK.border}` }}
-                  onClick={() => fileInputRef.current?.click()}
+                  style={{ width: '100%', borderRadius: 6, objectFit: 'cover', display: 'block' }}
                 />
+                <Box sx={{
+                  position: 'absolute', bottom: 0, right: 0,
+                  backgroundColor: 'rgba(0,0,0,0.7)', px: 1, py: 0.5,
+                  borderRadius: '4px 0 0 0',
+                }}>
+                  <Typography sx={{ fontSize: 11, color: '#fff', fontWeight: 600 }}>Replace slide</Typography>
+                </Box>
               </Box>
             ) : (
               <Box
@@ -222,32 +141,116 @@ export const CuePointForm = ({ initial, editingId, saving, currentTime, pid, ks,
                 onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
                 onClick={() => fileInputRef.current?.click()}
                 sx={{
-                  border: `2px dashed ${dragOver ? '#006efa' : DARK.border}`,
+                  border: `2px dashed ${dragOver ? '#006efa' : D.border}`,
                   borderRadius: 1.5, p: 2, textAlign: 'center', cursor: 'pointer',
-                  backgroundColor: dragOver ? 'rgba(0,110,250,.08)' : DARK.inputBg,
+                  backgroundColor: dragOver ? 'rgba(0,110,250,.05)' : 'rgba(0,0,0,0.2)',
                   display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.5,
                 }}
               >
-                <CloudUpload sx={{ color: DARK.textSecondary, fontSize: 24 }} />
-                <Typography sx={{ fontSize: 12, color: DARK.textSecondary }}>Click or drag an image here</Typography>
+                <CloudUpload sx={{ color: D.muted, fontSize: 24 }} />
+                <Typography sx={{ fontSize: 12, color: D.muted }}>Click or drag an image here</Typography>
               </Box>
             )}
             <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }}
               onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }} />
           </Box>
         )}
+
+        {/* Title */}
+        <Box>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
+            <Typography sx={labelSx}>{isSlide ? 'Slide name' : 'Chapter name'}</Typography>
+            <Typography sx={counterSx}>{title.length}/75</Typography>
+          </Box>
+          <TextField
+            value={title}
+            onChange={e => e.target.value.length <= 75 && setTitle(e.target.value)}
+            size="small" fullWidth
+            placeholder={isSlide ? 'Untitled slide' : 'Untitled chapter'}
+            sx={inputSx}
+          />
+        </Box>
+
+        {/* Summary / Description */}
+        <Box>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
+            <Typography sx={labelSx}>{isSlide ? 'Description' : 'Chapter summary'}</Typography>
+            <Typography sx={counterSx}>{description.length}/500</Typography>
+          </Box>
+          {/* Rich text toolbar */}
+          <Box sx={{
+            display: 'flex', alignItems: 'center', gap: 0.25, px: 0.5, py: 0.25,
+            backgroundColor: 'rgba(0,0,0,0.3)', border: `1px solid ${D.border}`,
+            borderBottom: 'none', borderRadius: '4px 4px 0 0',
+          }}>
+            {[FormatBold, FormatItalic, FormatUnderlined, FormatListBulleted, FormatListNumbered].map((Icon, i) => (
+              <IconButton key={i} size="small" sx={{ color: D.muted, p: 0.4, borderRadius: '4px', '&:hover': { color: D.text, backgroundColor: 'rgba(255,255,255,0.1)' } }}>
+                <Icon sx={{ fontSize: 16 }} />
+              </IconButton>
+            ))}
+          </Box>
+          <TextField
+            value={description}
+            onChange={e => e.target.value.length <= 500 && setDescription(e.target.value)}
+            multiline rows={4} fullWidth
+            sx={{ ...inputSx, '& .MuiInputBase-root': { ...inputSx['& .MuiInputBase-root'], borderRadius: '0 0 4px 4px' } }}
+          />
+        </Box>
+
+        {/* Timestamp */}
+        <Box>
+          <Typography sx={{ ...labelSx, mb: 0.75 }}>Timestamp</Typography>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+            <TextField
+              value={timeStr}
+              onChange={e => setTimeStr(e.target.value)}
+              size="small"
+              sx={{ width: 90, ...inputSx }}
+              inputProps={{ style: { fontVariantNumeric: 'tabular-nums' } }}
+            />
+            <IconButton
+              onClick={useCurrentTime}
+              size="small"
+              title="Use current time"
+              sx={{ backgroundColor: 'rgba(0,0,0,0.6)', color: D.text, borderRadius: '4px', p: 0.5, '&:hover': { backgroundColor: 'rgba(255,255,255,0.1)' } }}
+            >
+              <GpsFixed sx={{ fontSize: 20 }} />
+            </IconButton>
+          </Box>
+        </Box>
       </Box>
 
-      {/* Footer actions */}
-      <Box sx={{ p: 2, borderTop: `1px solid ${DARK.border}`, display: 'flex', justifyContent: 'flex-end', gap: 1 }}>
-        <Button size="small" onClick={onCancel} disabled={saving}
-          sx={{ color: DARK.textSecondary, fontSize: 12, textTransform: 'none', border: `1px solid ${DARK.border}`, '&:hover': { backgroundColor: '#333' } }}>
-          Cancel
-        </Button>
-        <Button size="small" onClick={submit} disabled={saving || !title.trim()}
-          sx={{ backgroundColor: '#006efa', color: '#fff', fontSize: 12, textTransform: 'none', '&:hover': { backgroundColor: '#004cad' }, '&:disabled': { backgroundColor: '#333', color: '#555' } }}>
-          {saving ? <CircularProgress size={13} color="inherit" /> : 'Save'}
-        </Button>
+      {/* Bottom actions */}
+      <Box sx={{ p: 1.5, borderTop: `1px solid ${D.border}`, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, flexShrink: 0 }}>
+
+        {/* New item: Create button */}
+        {!editingId && (
+          <Button fullWidth
+            onClick={() => onSave({ type, startTime: displayToMs(timeStr), title, description, tags: initial?.tags ?? '', imageFile })}
+            disabled={saving || !title.trim()}
+            sx={{ backgroundColor: '#006efa', color: '#fff', textTransform: 'none', fontSize: 14, fontWeight: 700, borderRadius: '4px', '&:hover': { backgroundColor: '#004cad' }, '&:disabled': { backgroundColor: '#333', color: '#555' } }}>
+            {saving ? <CircularProgress size={14} color="inherit" /> : `Create ${isSlide ? 'slide' : 'chapter'}`}
+          </Button>
+        )}
+
+        {/* Existing item: Apply to player (saves but keeps form open) */}
+        {editingId && (
+          <Button fullWidth
+            onClick={() => onSave({ type, startTime: displayToMs(timeStr), title, description, tags: initial?.tags ?? '', imageFile })}
+            disabled={saving || !title.trim()}
+            sx={{ backgroundColor: '#006efa', color: '#fff', textTransform: 'none', fontSize: 14, fontWeight: 700, borderRadius: '4px', '&:hover': { backgroundColor: '#004cad' }, '&:disabled': { backgroundColor: '#333', color: '#555' } }}>
+            {saving ? <CircularProgress size={14} color="inherit" /> : 'Apply to player'}
+          </Button>
+        )}
+
+        {/* Delete */}
+        {editingId && (
+          <Box onClick={() => !saving && onDelete(editingId)}
+            sx={{ display: 'flex', alignItems: 'center', gap: 0.75, cursor: saving ? 'default' : 'pointer', color: '#ca1c2d', opacity: saving ? 0.5 : 1, py: 0.5, px: 1.5, borderRadius: '4px', '&:hover': { backgroundColor: 'rgba(202,28,45,0.1)' } }}>
+            <Delete sx={{ fontSize: 18 }} />
+            <Typography sx={{ fontSize: 14, fontWeight: 700, color: 'inherit' }}>Delete {isSlide ? 'slide' : 'chapter'}</Typography>
+          </Box>
+        )}
       </Box>
     </Box>
   );

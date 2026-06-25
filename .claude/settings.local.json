@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(claude context *)",
-      "Bash(Select-String -Pattern \"context|mcp\" -i)"
+      "Bash(Select-String -Pattern \"context|mcp\" -i)",
+      "mcp__atlassian__getConfluencePage"
     ]
   }
 }
