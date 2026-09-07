@@ -1,3 +1,7 @@
 node_modules
 dist
 .env
+
+# Figma/icon reference material, not code
+figma-*.png
+icon*.png

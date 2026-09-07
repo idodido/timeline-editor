@@ -17,7 +17,6 @@ export const Player = ({ entryId, uiconfId, onReady }: PlayerProps) => {
     if (!pid || !uiconfId || !entryId) return;
 
     if (document.getElementById('kalturaV7Lib')) {
-      // Script already loaded — setup directly
       setup(pid, ks);
       return;
     }
@@ -44,9 +43,7 @@ export const Player = ({ entryId, uiconfId, onReady }: PlayerProps) => {
     }
   };
 
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  useEffect(() => { setMounted(true); }, []);
 
   useEffect(() => {
     if (mounted) embed();

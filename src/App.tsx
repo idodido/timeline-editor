@@ -1,27 +1,39 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Box, Button, CircularProgress, IconButton, TextField, Typography } from '@mui/material';
-import { AutoAwesome, Add, ZoomIn, ZoomOut, FitScreen, Check, Delete, GpsFixed } from '@mui/icons-material';
+import {
+  Alert, Box, Button, CircularProgress, IconButton, TextField, Typography,
+  Dialog, DialogTitle, DialogContent, DialogActions, MenuItem, Select,
+} from '@mui/material';
+import { AutoAwesome, Add, ZoomIn, ZoomOut, FitScreen, Check, Feedback as FeedbackIcon } from '@mui/icons-material';
 import { CuePoint, TimelineRuler } from './components/TimelineRuler';
 import { RightPanel } from './components/RightPanel';
 import { Player } from './components/Player';
 import {
   startSession, initKaltura, getConfig,
-  listCuePoints, addChapter, addSlide, updateCuePoint, deleteCuePoint,
-  uploadSlideImage, RawCuePoint,
+  listCuePoints, addSlide, updateCuePoint, deleteCuePoint,
+  RawCuePoint,
 } from './services/kaltura-api';
+import {
+  getPublishedSummary, publishSummary, setSummaryKs,
+  SummaryChapter,
+} from './services/summary-api';
+import { isFeedbackConfigured, setFeedbackConfig, submitFeedback, FEEDBACK_TYPES } from './services/feedback-api';
 
 // ── Pending op types ──────────────────────────────────────────────────────
-type PendingOp =
-  | { kind: 'add';    tempId: string; data: { type: 'chapter'|'slide'; startTime: number; title: string; description: string; tags: string; imageFile: File|null } }
+type PendingChapterOp =
+  | { kind: 'chapter_set'; chapters: SummaryChapter[]; summary: string }; // full replace on publish
+
+type PendingSlideOp =
+  | { kind: 'add';    tempId: string; data: { startTime: number; title: string; description: string; tags: string; imageFile: File|null } }
   | { kind: 'update'; id: string;     data: { startTime: number; title: string; description: string; tags: string } }
   | { kind: 'delete'; id: string };
 
+type PendingOp = PendingChapterOp | PendingSlideOp;
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
 const DARK = {
-  bg: '#121212',
-  surface: '#1e1e1e',
-  border: '#2e2e2e',
-  text: '#ffffff',
-  textSecondary: '#888888',
+  bg: '#121212', surface: '#1e1e1e', border: '#2e2e2e',
+  text: '#ffffff', textSecondary: '#888888',
 };
 
 const DEFAULTS = {
@@ -45,28 +57,100 @@ const inputDarkSx = {
   '& .MuiInputLabel-root': { color: '#888' },
 };
 
-const rawToCuePoint = (r: RawCuePoint): CuePoint => {
-  console.log('[rawToCuePoint]', r.id, 'objectType:', r.objectType, 'subType:', r.subType, 'cuePointType:', r.cuePointType);
+// Convert old-style cue point chapter → SummaryChapter (ms → seconds)
+const cuePointToSummaryChapter = (cp: CuePoint): SummaryChapter => ({
+  time: Math.round(cp.startTime / 1000),
+  title: cp.title,
+  description: cp.description,
+});
+
+// Convert SummaryChapter → CuePoint-like for the unified list (seconds → ms)
+const summaryChapterToCuePoint = (ch: SummaryChapter, index: number): CuePoint => ({
+  id: `sum_${index}_${ch.time}`,
+  type: 'chapter',
+  startTime: ch.time * 1000, // ms for timeline consistency
+  title: ch.title,
+  description: ch.description,
+  tags: '',
+  objectType: 'SummaryChapter',
+  subType: 2,
+});
+
+// Converts any raw cue point — preserves subType so we can split chapters vs slides
+const rawSlideToCuePoint = (r: RawCuePoint): CuePoint => ({
+  id: r.id,
+  type: r.subType === 1 ? 'slide' : 'chapter',
+  startTime: r.startTime,
+  title: r.title || '',
+  description: r.description || '',
+  tags: r.tags || '',
+  assetId: r.assetId,
+  objectType: r.objectType,
+  subType: r.subType ?? 2,
+});
+
+// ── Embedded mode ─────────────────────────────────────────────────────────
+// When hosted inside KMS (or any page that mints its own KS server-side),
+// props arrive either as `window.__TIMELINE_EDITOR_PROPS__` (set by the host
+// before this app mounts) or as URL query params (handy for manual testing).
+// If a `ks` is present, the login screen is skipped entirely — the host
+// already authenticated the user before this app ever loaded.
+
+interface EmbedProps {
+  ks: string;
+  entryId: string;
+  playerId?: string;
+  serviceUrl?: string;
+  partnerId?: string;
+  feedbackKs?: string;
+  feedbackPartnerId?: string;
+  kmsUserId?: string;
+}
+
+declare global {
+  interface Window { __TIMELINE_EDITOR_PROPS__?: EmbedProps; }
+}
+
+const readEmbedProps = (): EmbedProps | null => {
+  if (window.__TIMELINE_EDITOR_PROPS__?.ks) return window.__TIMELINE_EDITOR_PROPS__;
+
+  const params = new URLSearchParams(window.location.search);
+  const ks = params.get('ks');
+  if (!ks) return null;
+
   return {
-    id: r.id,
-    type: r.subType === 1 ? 'slide' : 'chapter',
-    startTime: r.startTime,
-    title: r.title || '',
-    description: r.description || '',
-    tags: r.tags || '',
-    assetId: r.assetId,
-    objectType: r.objectType,
-    subType: r.subType,
+    ks,
+    entryId: params.get('entryId') ?? '',
+    playerId: params.get('playerId') ?? undefined,
+    serviceUrl: params.get('serviceUrl') ?? undefined,
+    partnerId: params.get('partnerId') ?? undefined,
+    feedbackKs: params.get('feedbackKs') ?? undefined,
+    feedbackPartnerId: params.get('feedbackPartnerId') ?? undefined,
+    kmsUserId: params.get('kmsUserId') ?? undefined,
   };
 };
 
+// ── Login screen ──────────────────────────────────────────────────────────
+
 export default function App() {
+  const [embedProps] = useState(() => readEmbedProps());
   const [mode, setMode] = useState<'choose' | 'own'>('choose');
   const [cfg, setCfg] = useState(EMPTY_CFG);
-  const [activeConfig, setActiveConfig] = useState(DEFAULTS);
-  const [ready, setReady] = useState(false);
+  const [activeConfig, setActiveConfig] = useState(() => embedProps
+    ? { pid: embedProps.partnerId ?? '', secret: '', uiconfId: embedProps.playerId ?? '', entryId: embedProps.entryId }
+    : DEFAULTS);
+  const [ready, setReady] = useState(() => !!embedProps);
   const [initError, setInitError] = useState('');
   const [initializing, setInitializing] = useState(false);
+
+  useEffect(() => {
+    if (!embedProps) return;
+    initKaltura({ pid: embedProps.partnerId ?? '', ks: embedProps.ks });
+    setSummaryKs(embedProps.ks);
+    if (embedProps.feedbackKs) setFeedbackConfig(embedProps.feedbackKs, embedProps.feedbackPartnerId);
+    // embedProps is read once at mount (useState initializer) and never changes — deliberately not in deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const connect = async (config: typeof DEFAULTS) => {
     setInitializing(true);
@@ -74,6 +158,7 @@ export default function App() {
     try {
       const ks = await startSession(config.pid, config.secret);
       initKaltura({ pid: config.pid, ks });
+      setSummaryKs(ks);
       setActiveConfig(config);
       setReady(true);
     } catch {
@@ -125,87 +210,158 @@ export default function App() {
     );
   }
 
-  return <TimelineEditor entryId={activeConfig.entryId} uiconfId={activeConfig.uiconfId} />;
+  return <TimelineEditor entryId={activeConfig.entryId} uiconfId={activeConfig.uiconfId} kmsUserId={embedProps?.kmsUserId} />;
 }
 
 // ── Main editor ───────────────────────────────────────────────────────────
 
-function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: string }) {
+function TimelineEditor({ entryId, uiconfId, kmsUserId }: { entryId: string; uiconfId: string; kmsUserId?: string }) {
   const playerRef = useRef<any>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [cuePoints, setCuePoints] = useState<CuePoint[]>([]);
+
+  // Chapters (from summary microservice) — stored as SummaryChapter[]
+  const [summaryChapters, setSummaryChapters] = useState<SummaryChapter[]>([]);
+  const [summaryText, setSummaryText] = useState('');
+
+  // Slides (from cue points) — CuePoint[]
+  const [slides, setSlides] = useState<CuePoint[]>([]);
+
+  // Old-style cue point chapters found on load → migration prompt
+  const [oldChapters, setOldChapters] = useState<CuePoint[]>([]);
+  const [showMigrationBanner, setShowMigrationBanner] = useState(false);
+  const [migrating, setMigrating] = useState(false);
+
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [publishSuccess, setPublishSuccess] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
-  // ── Undo/redo history ─────────────────────────────────────────────────
-  // Each history entry is a snapshot of [cuePoints, pendingOps]
-  type Snapshot = { cuePoints: CuePoint[]; pendingOps: PendingOp[] };
+  // ── Feedback (always goes to a fixed partner, independent of the current session) ──
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackType, setFeedbackType] = useState(FEEDBACK_TYPES[0]);
+  const [feedbackText, setFeedbackText] = useState('');
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackError, setFeedbackError] = useState('');
+  const [feedbackSent, setFeedbackSent] = useState(false);
+
+  const openFeedback = useCallback(() => {
+    setFeedbackType(FEEDBACK_TYPES[0]);
+    setFeedbackText('');
+    setFeedbackError('');
+    setFeedbackSent(false);
+    setFeedbackOpen(true);
+  }, []);
+
+  const submitFeedbackForm = useCallback(async () => {
+    if (!feedbackText.trim()) return;
+    setFeedbackSubmitting(true);
+    setFeedbackError('');
+    try {
+      await submitFeedback(feedbackType, feedbackText.trim(), { entryId, kmsUserId });
+      setFeedbackSent(true);
+    } catch (e: any) {
+      setFeedbackError(e.message || 'Failed to send feedback');
+    } finally {
+      setFeedbackSubmitting(false);
+    }
+  }, [feedbackType, feedbackText, entryId, kmsUserId]);
+
+  // Draft: chapters are tracked separately from slides
+  // For chapters: we track the full list (replace-on-publish)
+  // For slides: individual ops
+  const [draftChapters, setDraftChapters] = useState<SummaryChapter[]>([]);
+  const [draftSummaryText, setDraftSummaryText] = useState('');
+  const [slidePendingOps, setSlidePendingOps] = useState<PendingSlideOp[]>([]);
+  const chaptersDirty = useRef(false);
+
+  // Combined cue points for timeline display
+  const cuePoints: CuePoint[] = [
+    ...draftChapters.map(summaryChapterToCuePoint),
+    ...slides,
+  ];
+
+  const isDirty = chaptersDirty.current || slidePendingOps.length > 0;
+
+  // ── Undo/redo ─────────────────────────────────────────────────────────
+  type Snapshot = { chapters: SummaryChapter[]; summaryText: string; slides: CuePoint[]; slideOps: PendingSlideOp[] };
   const [history, setHistory] = useState<Snapshot[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
-  const [pendingOps, setPendingOps] = useState<PendingOp[]>([]);
-  const isDirty = pendingOps.length > 0;
 
-  // Push a snapshot BEFORE making a change
-  const pushHistory = useCallback((currentCps: CuePoint[], currentOps: PendingOp[]) => {
-    setHistory(prev => {
-      const trimmed = prev.slice(0, historyIndex + 1);
-      return [...trimmed, { cuePoints: currentCps, pendingOps: currentOps }];
-    });
+  const pushHistory = useCallback((ch: SummaryChapter[], st: string, sl: CuePoint[], ops: PendingSlideOp[]) => {
+    setHistory(prev => [...prev.slice(0, historyIndex + 1), { chapters: ch, summaryText: st, slides: sl, slideOps: ops }]);
     setHistoryIndex(prev => prev + 1);
   }, [historyIndex]);
 
   const canUndo = historyIndex >= 0;
   const canRedo = historyIndex < history.length - 1;
 
-  const undo = useCallback(() => {
-    if (!canUndo) return;
-    const snap = history[historyIndex];
-    setCuePoints(snap.cuePoints);
-    setPendingOps(snap.pendingOps);
-    setHistoryIndex(prev => prev - 1);
-    setEditingId(null);
-    setSelectedCp(null);
-    setFormInitial(null);
-  }, [canUndo, history, historyIndex]);
+  const applySnapshot = useCallback((snap: Snapshot) => {
+    setDraftChapters(snap.chapters);
+    setDraftSummaryText(snap.summaryText);
+    setSlides(snap.slides);
+    setSlidePendingOps(snap.slideOps);
+    setEditingId(null); setSelectedCp(null); setFormInitial(null);
+  }, []);
 
-  const redo = useCallback(() => {
-    if (!canRedo) return;
-    const snap = history[historyIndex + 1];
-    setCuePoints(snap.cuePoints);
-    setPendingOps(snap.pendingOps);
-    setHistoryIndex(prev => prev + 1);
-    setEditingId(null);
-    setSelectedCp(null);
-    setFormInitial(null);
-  }, [canRedo, history, historyIndex]);
+  const undo = useCallback(() => { if (canUndo) { applySnapshot(history[historyIndex]); setHistoryIndex(p => p - 1); } }, [canUndo, history, historyIndex, applySnapshot]);
+  const redo = useCallback(() => { if (canRedo) { applySnapshot(history[historyIndex + 1]); setHistoryIndex(p => p + 1); } }, [canRedo, history, historyIndex, applySnapshot]);
 
-  // Keyboard shortcuts: Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey) {
         if (e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
-        if ((e.key === 'y') || (e.key === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
+        if (e.key === 'y' || (e.key === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [undo, redo]);
+
+  // ── Form state ────────────────────────────────────────────────────────
   const [selectedCp, setSelectedCp] = useState<CuePoint | null>(null);
-  const [formOpen, setFormOpen] = useState(true); // panel always starts open
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formInitial, setFormInitial] = useState<(Partial<CuePoint> & { startTime: number }) | null>(null);
 
   const { pid, ks } = getConfig();
 
+  // ── Load data ─────────────────────────────────────────────────────────
   useEffect(() => {
-    listCuePoints(entryId)
-      .then(raw => { setCuePoints(raw.map(rawToCuePoint).sort((a, b) => a.startTime - b.startTime)); setLoading(false); })
-      .catch((e: any) => { setError(e.message || 'Failed to load cue points'); setLoading(false); });
+    const load = async () => {
+      try {
+        // Parallel: summary chapters + cue point slides
+        const [summaryData, rawCuePoints] = await Promise.all([
+          getPublishedSummary(entryId),
+          listCuePoints(entryId),
+        ]);
+
+        const allCps = rawCuePoints.map(rawSlideToCuePoint);
+        const cueSlides = allCps.filter(c => c.subType === 1);
+        const cueChapters = allCps.filter(c => c.subType === 2); // old-style
+
+        // Always load summary chapters if they exist
+        if (summaryData?.chapters?.length) {
+          setSummaryChapters(summaryData.chapters);
+          setDraftChapters(summaryData.chapters);
+          setSummaryText(summaryData.summary || '');
+          setDraftSummaryText(summaryData.summary || '');
+        }
+
+        // Always show migration banner as long as old cue point chapters exist
+        if (cueChapters.length > 0) {
+          setOldChapters(cueChapters);
+          setShowMigrationBanner(true);
+        }
+
+        setSlides(cueSlides);
+        setLoading(false);
+      } catch (e: any) {
+        setError(e.message || 'Failed to load');
+        setLoading(false);
+      }
+    };
+    load();
   }, [entryId]);
 
   useEffect(() => {
@@ -214,6 +370,38 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
     return () => clearTimeout(t);
   }, [success]);
 
+  // ── Migration ─────────────────────────────────────────────────────────
+  const migrate = useCallback(async () => {
+    setMigrating(true);
+    try {
+      const migratedChapters = oldChapters
+        .sort((a, b) => a.startTime - b.startTime)
+        .map(cuePointToSummaryChapter);
+
+      // 1. Write to summary microservice
+      await publishSummary(entryId, { summary: '', chapters: migratedChapters });
+
+      // 2. Delete old cue point chapters so the player doesn't show duplicates
+      await Promise.all(oldChapters.map(ch => deleteCuePoint(ch.id)));
+
+      setSummaryChapters(migratedChapters);
+      setDraftChapters(migratedChapters);
+      setOldChapters([]);
+      chaptersDirty.current = false;
+      setShowMigrationBanner(false);
+
+      // Refresh player to remove old chapters
+      try { playerRef.current?.loadMedia({ entryId }); } catch {}
+
+      setSuccess(`Migrated ${migratedChapters.length} chapters — old chapters removed from player`);
+    } catch (e: any) {
+      setError(e.message || 'Migration failed');
+    } finally {
+      setMigrating(false);
+    }
+  }, [entryId, oldChapters]);
+
+  // ── Player ────────────────────────────────────────────────────────────
   const handlePlayerReady = useCallback((kp: any) => {
     playerRef.current = kp;
     kp.addEventListener('timeupdate', () => setCurrentTime(kp.currentTime));
@@ -226,100 +414,138 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
     setCurrentTime(t);
   }, []);
 
+  // ── Open/close form ───────────────────────────────────────────────────
   const openAdd = useCallback((type: 'chapter' | 'slide') => {
     try { if (playerRef.current) playerRef.current.pause(); } catch {}
-    setEditingId(null);
-    setSelectedCp(null);
+    setEditingId(null); setSelectedCp(null);
     setFormInitial({ type, startTime: Math.round(currentTime * 1000), title: '', description: '', tags: '' });
-    setFormOpen(true);
   }, [currentTime]);
 
   const openEdit = useCallback((cp: CuePoint) => {
-    if (!cp.id) {
-      // deselect signal from accordion collapse
-      setSelectedCp(null);
-      setEditingId(null);
-      setFormInitial(null);
-      return;
-    }
+    if (!cp.id) { setSelectedCp(null); setEditingId(null); setFormInitial(null); return; }
     seek(cp.startTime / 1000);
-    setSelectedCp(cp);
-    setEditingId(cp.id);
+    setSelectedCp(cp); setEditingId(cp.id);
     setFormInitial({ ...cp });
-    setFormOpen(true);
   }, [seek]);
 
   const closeForm = useCallback(() => {
-    setFormOpen(false);
-    setEditingId(null);
-    setSelectedCp(null);
-    setFormInitial(null);
+    setEditingId(null); setSelectedCp(null); setFormInitial(null);
   }, []);
 
-  // ── Local-only save (no API call) ────────────────────────────────────────
+  // ── Local save ────────────────────────────────────────────────────────
   const handleSave = useCallback((data: { type: 'chapter'|'slide'; startTime: number; title: string; description: string; tags: string; imageFile: File|null }) => {
-    pushHistory(cuePoints, pendingOps); // snapshot before change
-    if (editingId) {
-      // Update existing cue point locally
-      setCuePoints(prev => prev
-        .map(c => c.id === editingId ? { ...c, startTime: data.startTime, title: data.title, description: data.description, tags: data.tags } : c)
-        .sort((a, b) => a.startTime - b.startTime));
-      setPendingOps(prev => {
-        // Merge: if there's already a pending add for this tempId, update its data
-        const existingAdd = prev.find(op => op.kind === 'add' && op.tempId === editingId);
-        if (existingAdd) {
-          return prev.map(op => op.kind === 'add' && op.tempId === editingId ? { ...op, data: { ...op.data, ...data } } : op);
-        }
-        // Otherwise upsert an update op
-        const withoutPrev = prev.filter(op => !(op.kind === 'update' && op.id === editingId));
-        return [...withoutPrev, { kind: 'update', id: editingId, data }];
-      });
+    pushHistory(draftChapters, draftSummaryText, slides, slidePendingOps);
+
+    if (data.type === 'chapter') {
+      // Chapters → update the summary chapters array
+      const timeInSec = Math.round(data.startTime / 1000);
+      if (editingId && editingId.startsWith('sum_')) {
+        // Edit existing
+        const oldTimeSec = parseInt(editingId.split('_')[2]);
+        setDraftChapters(prev => prev
+          .map(ch => ch.time === oldTimeSec ? { time: timeInSec, title: data.title, description: data.description } : ch)
+          .sort((a, b) => a.time - b.time));
+        // Update selectedCp to reflect new id
+        const updatedCp = summaryChapterToCuePoint({ time: timeInSec, title: data.title, description: data.description }, 0);
+        setEditingId(`sum_0_${timeInSec}`);
+        setSelectedCp(updatedCp);
+        setFormInitial({ ...updatedCp });
+      } else {
+        // Add new
+        const newChapter: SummaryChapter = { time: timeInSec, title: data.title, description: data.description };
+        const updated = [...draftChapters, newChapter].sort((a, b) => a.time - b.time);
+        setDraftChapters(updated);
+        const idx = updated.findIndex(c => c.time === timeInSec && c.title === data.title);
+        const newCp = summaryChapterToCuePoint(newChapter, idx);
+        setEditingId(newCp.id);
+        setSelectedCp(newCp);
+        setFormInitial({ ...newCp });
+      }
+      chaptersDirty.current = true;
     } else {
-      // Add new cue point locally with a temp ID
-      const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      const newCp: CuePoint = {
-        id: tempId, type: data.type,
-        startTime: data.startTime, title: data.title,
-        description: data.description, tags: data.tags,
-        objectType: 'KalturaThumbCuePoint',
-        subType: data.type === 'slide' ? 1 : 2,
-      };
-      setCuePoints(prev => [...prev, newCp].sort((a, b) => a.startTime - b.startTime));
-      setPendingOps(prev => [...prev, { kind: 'add', tempId, data }]);
-      setEditingId(tempId);
-      setSelectedCp(newCp);
-      setFormInitial({ ...newCp });
+      // Slides → cue point ops
+      if (editingId && !editingId.startsWith('temp_')) {
+        setSlides(prev => prev.map(s => s.id === editingId
+          ? { ...s, startTime: data.startTime, title: data.title, description: data.description }
+          : s).sort((a, b) => a.startTime - b.startTime));
+        setSlidePendingOps(prev => {
+          const without = prev.filter(op => !(op.kind === 'update' && op.id === editingId));
+          return [...without, { kind: 'update', id: editingId, data }];
+        });
+      } else {
+        const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const newSlide: CuePoint = { id: tempId, type: 'slide', startTime: data.startTime, title: data.title, description: data.description, tags: data.tags, objectType: 'KalturaThumbCuePoint', subType: 1 };
+        setSlides(prev => [...prev, newSlide].sort((a, b) => a.startTime - b.startTime));
+        setSlidePendingOps(prev => [...prev, { kind: 'add', tempId, data }]);
+        setEditingId(tempId);
+        setSelectedCp(newSlide);
+        setFormInitial({ ...newSlide });
+      }
     }
-  }, [editingId, cuePoints, pendingOps, pushHistory]);
+  }, [editingId, draftChapters, draftSummaryText, slides, slidePendingOps, pushHistory]);
 
-  // ── Local-only delete (no API call) ──────────────────────────────────────
   const handleDelete = useCallback((id: string) => {
-    pushHistory(cuePoints, pendingOps); // snapshot before change
-    setCuePoints(prev => prev.filter(c => c.id !== id));
-    setPendingOps(prev => {
-      // If it was a pending add (temp ID), just drop the add op — nothing to delete on server
-      if (id.startsWith('temp_')) return prev.filter(op => !(op.kind === 'add' && op.tempId === id));
-      // Otherwise remove any pending update for it, and add a delete op
-      const withoutUpdate = prev.filter(op => !(op.kind === 'update' && op.id === id));
-      return [...withoutUpdate, { kind: 'delete', id }];
-    });
-    if (editingId === id) {
-      setEditingId(null);
-      setSelectedCp(null);
-      setFormInitial(null);
+    pushHistory(draftChapters, draftSummaryText, slides, slidePendingOps);
+    if (id.startsWith('sum_')) {
+      const timeSec = parseInt(id.split('_')[2]);
+      setDraftChapters(prev => prev.filter(ch => ch.time !== timeSec));
+      chaptersDirty.current = true;
+    } else {
+      setSlides(prev => prev.filter(s => s.id !== id));
+      setSlidePendingOps(prev => {
+        if (id.startsWith('temp_')) return prev.filter(op => !(op.kind === 'add' && op.tempId === id));
+        return [...prev.filter(op => !(op.kind === 'update' && op.id === id)), { kind: 'delete', id }];
+      });
     }
-  }, [editingId, cuePoints, pendingOps, pushHistory]);
+    if (editingId === id) { setEditingId(null); setSelectedCp(null); setFormInitial(null); }
+  }, [editingId, draftChapters, draftSummaryText, slides, slidePendingOps, pushHistory]);
 
-  // Header pill button style
+  // ── Publish ───────────────────────────────────────────────────────────
+  const handlePublish = async () => {
+    setPublishing(true);
+    setError('');
+    try {
+      // 1. Publish chapters to summary microservice
+      if (chaptersDirty.current) {
+        await publishSummary(entryId, { summary: draftSummaryText, chapters: draftChapters });
+        setSummaryChapters(draftChapters);
+        chaptersDirty.current = false;
+      }
+      // 2. Execute slide ops
+      for (const op of slidePendingOps) {
+        if (op.kind === 'add') {
+          await (await import('./services/kaltura-api')).addSlide(entryId, op.data.startTime, op.data.title, op.data.description, op.data.tags, op.data.imageFile);
+        } else if (op.kind === 'update') {
+          await updateCuePoint(op.id, 1, op.data.startTime, op.data.title, op.data.description, op.data.tags);
+        } else if (op.kind === 'delete') {
+          await deleteCuePoint(op.id);
+        }
+      }
+      setSlidePendingOps([]);
+      // Reload slides from server
+      const fresh = await listCuePoints(entryId);
+      setSlides(fresh.map(rawSlideToCuePoint).filter(s => s.subType === 1));
+      try { playerRef.current?.loadMedia({ entryId }); } catch {}
+      setPublishSuccess(true);
+      setTimeout(() => setPublishSuccess(false), 3000);
+    } catch (e: any) {
+      setError(e.message || 'Publish failed');
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  // ── Pill button style ─────────────────────────────────────────────────
   const pillSx = (primary?: boolean) => ({
     height: 32, px: 1.5, py: 1, textTransform: 'none' as const, fontSize: 13,
-    fontWeight: 700, borderRadius: '4px', whiteSpace: 'nowrap' as const,
+    fontWeight: 700, borderRadius: '4px', whiteSpace: 'nowrap' as const, minWidth: 0,
     border: primary ? 'none' : '1px solid rgba(255,255,255,0.3)',
     color: primary ? '#fff' : 'rgba(255,255,255,0.7)',
-    minWidth: 0,
     background: primary ? 'linear-gradient(68deg, #006efa 11%, #2485ff 30%, #ff9dff 134%)' : 'transparent',
     '&:hover': { backgroundColor: primary ? undefined : 'rgba(255,255,255,0.08)' },
   });
+
+  const pendingCount = slidePendingOps.length + (chaptersDirty.current ? 1 : 0);
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', backgroundColor: '#000', color: '#fff' }}>
@@ -331,67 +557,52 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
         </IconButton>
         <Typography sx={{ flex: 1, textAlign: 'center', fontWeight: 700, fontSize: 15 }}>Chapters &amp; slides</Typography>
         <Box sx={{ display: 'flex', gap: 1 }}>
+          {isFeedbackConfigured() && (
+            <Button sx={pillSx()} startIcon={<FeedbackIcon sx={{ fontSize: 16 }} />} onClick={openFeedback}>Feedback</Button>
+          )}
           <Button sx={pillSx(true)} startIcon={<AutoAwesome sx={{ fontSize: 16 }} />}>Generate with AI</Button>
           <Button sx={pillSx()}>Save draft</Button>
           <Button
             disabled={publishing || !isDirty}
-            onClick={async () => {
-              setPublishing(true);
-              setPublishSuccess(false);
-              setError('');
-              try {
-                // Execute all pending ops in order
-                for (const op of pendingOps) {
-                  if (op.kind === 'add') {
-                    if (op.data.type === 'chapter') {
-                      await addChapter(entryId, op.data.startTime, op.data.title, op.data.description, op.data.tags);
-                    } else {
-                      await addSlide(entryId, op.data.startTime, op.data.title, op.data.description, op.data.tags, op.data.imageFile);
-                    }
-                  } else if (op.kind === 'update') {
-                    const cp = cuePoints.find(c => c.id === op.id);
-                    if (cp) await updateCuePoint(op.id, cp.subType ?? (cp.type === 'slide' ? 1 : 2), op.data.startTime, op.data.title, op.data.description, op.data.tags);
-                  } else if (op.kind === 'delete') {
-                    await deleteCuePoint(op.id);
-                  }
-                }
-                setPendingOps([]);
-                setIsDirty(false);
-                // Reload cue points from server and refresh player
-                const fresh = await listCuePoints(entryId);
-                setCuePoints(fresh.map(rawToCuePoint).sort((a, b) => a.startTime - b.startTime));
-                try { playerRef.current?.loadMedia({ entryId }); } catch {}
-                setPublishSuccess(true);
-                setTimeout(() => setPublishSuccess(false), 3000);
-              } catch (e: any) {
-                setError(e.message || 'Publish failed');
-              } finally {
-                setPublishing(false);
-              }
-            }}
+            onClick={handlePublish}
             sx={{
-              ...pillSx(),
-              border: 'none',
-              backgroundColor: publishSuccess ? '#23803a' : '#006efa',
-              color: '#fff',
+              ...pillSx(), border: 'none',
+              backgroundColor: publishSuccess ? '#23803a' : '#006efa', color: '#fff',
               opacity: publishing ? 0.7 : 1,
               '&:hover': { backgroundColor: publishSuccess ? '#1a6030' : '#004cad' },
               '&:disabled': { backgroundColor: '#333', color: '#666' },
             }}
-            startIcon={publishing ? <CircularProgress size={14} color="inherit" /> : publishSuccess ? <Check sx={{ fontSize: 16, color: '#23803a' }} /> : <Check sx={{ fontSize: 16 }} />}
+            startIcon={publishing ? <CircularProgress size={14} color="inherit" /> : <Check sx={{ fontSize: 16 }} />}
           >
-            {publishSuccess ? 'Changes saved!' : isDirty ? `Publish to media (${pendingOps.length})` : 'Publish to media'}
+            {publishSuccess ? 'Changes saved!' : isDirty ? `Publish to media (${pendingCount})` : 'Publish to media'}
           </Button>
         </Box>
       </Box>
 
-      {/* ── Editor body: main-canvas + right panel (full height siblings) ── */}
+      {/* ── Migration banner ── */}
+      {showMigrationBanner && (
+        <Box sx={{ backgroundColor: 'rgba(255,152,0,0.15)', border: '1px solid rgba(255,152,0,0.4)', px: 3, py: 1.5, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 2 }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="#ff9800" strokeWidth="2" strokeLinecap="round"/></svg>
+          <Typography sx={{ flex: 1, fontSize: 13, color: 'rgba(255,255,255,0.9)' }}>
+            We found <strong>{oldChapters.length} chapters</strong> in the old format. Migrate them to the new format — old chapters will be removed from the player and replaced with the new ones.
+          </Typography>
+          <Button size="small" onClick={() => setShowMigrationBanner(false)}
+            sx={{ color: 'rgba(255,255,255,0.5)', textTransform: 'none', fontSize: 12, minWidth: 0 }}>
+            Dismiss
+          </Button>
+          <Button size="small" onClick={migrate} disabled={migrating}
+            sx={{ backgroundColor: '#ff9800', color: '#000', textTransform: 'none', fontSize: 12, fontWeight: 700, borderRadius: '4px', px: 1.5, '&:hover': { backgroundColor: '#e68900' } }}>
+            {migrating ? <CircularProgress size={14} /> : `Migrate ${oldChapters.length} chapters`}
+          </Button>
+        </Box>
+      )}
+
+      {/* ── Editor body ── */}
       <Box sx={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
 
-        {/* Main canvas: player on top, timeline at bottom */}
+        {/* Main canvas */}
         <Box sx={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
-          {/* Player */}
           <Box sx={{ flex: 1, minHeight: 0, backgroundColor: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <Player entryId={entryId} uiconfId={uiconfId} onReady={handlePlayerReady} />
           </Box>
@@ -404,16 +615,14 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
                 {error && <Alert severity="error" sx={{ py: 0, fontSize: 11 }} onClose={() => setError('')}>{error}</Alert>}
               </Box>
             )}
-            {/* Add buttons + zoom */}
             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 3, pt: 1.5, pb: 0.5 }}>
               <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center' }}>
                 {(['chapter','slide'] as const).map(type => (
                   <Button key={type} size="small" startIcon={<Add sx={{ fontSize: 16 }}/>} onClick={() => openAdd(type)}
                     sx={{ backgroundColor:'rgba(0,0,0,0.6)', color:'#fff', textTransform:'none', fontSize:13, fontWeight:700, borderRadius:'4px', px:1.5, py:0.75, border:'none', '&:hover':{ backgroundColor:'rgba(255,255,255,0.1)' } }}>
-                    Add {type === 'chapter' ? 'chapter' : 'slide deck'}
+                    Add {type === 'chapter' ? 'chapter' : 'slide'}
                   </Button>
                 ))}
-                {/* Undo / Redo */}
                 <Box sx={{ display:'flex', gap:0.5, ml:0.5 }}>
                   <IconButton size="small" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
                     sx={{ width:32, height:32, color: canUndo ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.25)', borderRadius:'4px', '&:hover':{ backgroundColor:'rgba(255,255,255,0.1)' } }}>
@@ -433,7 +642,6 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
                 ))}
               </Box>
             </Box>
-            {/* Timeline ruler */}
             {loading
               ? <Box sx={{ display:'flex', justifyContent:'center', py:2 }}><CircularProgress size={20} sx={{ color:'#006efa' }}/></Box>
               : <TimelineRuler duration={duration} currentTime={currentTime} cuePoints={cuePoints}
@@ -443,26 +651,61 @@ function TimelineEditor({ entryId, uiconfId }: { entryId: string; uiconfId: stri
           </Box>
         </Box>
 
-        {/* Right panel — always visible */}
-        {true && (
-          <Box sx={{ width: 320, flexShrink: 0, borderLeft: '1px solid rgba(255,255,255,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <RightPanel
-              cuePoints={cuePoints}
-              editingId={editingId}
-              formInitial={formInitial}
-              saving={saving}
-              currentTime={currentTime}
-              pid={pid}
-              ks={ks}
-              onSave={handleSave}
-              onDelete={handleDelete}
-              onSelectCuePoint={openEdit}
-              onAddNew={openAdd}
-              onClose={closeForm}
-            />
-          </Box>
-        )}
+        {/* Right panel */}
+        <Box sx={{ width: 320, flexShrink: 0, borderLeft: '1px solid rgba(255,255,255,0.12)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <RightPanel
+            cuePoints={cuePoints}
+            editingId={editingId}
+            formInitial={formInitial}
+            saving={false}
+            currentTime={currentTime}
+            pid={pid}
+            ks={ks}
+            summaryText={draftSummaryText}
+            onSummaryChange={(text) => {
+              setDraftSummaryText(text);
+              chaptersDirty.current = true;
+            }}
+            onSave={handleSave}
+            onDelete={handleDelete}
+            onSelectCuePoint={openEdit}
+            onAddNew={openAdd}
+            onClose={closeForm}
+          />
+        </Box>
       </Box>
+
+      {/* ── Feedback dialog ── */}
+      <Dialog open={feedbackOpen} onClose={() => setFeedbackOpen(false)} maxWidth="sm" fullWidth
+        PaperProps={{ sx: { backgroundColor: DARK.surface, color: '#fff' } }}>
+        <DialogTitle>Send feedback</DialogTitle>
+        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          {feedbackSent ? (
+            <Alert severity="success">Thanks — your feedback was sent.</Alert>
+          ) : (
+            <>
+              <Select size="small" value={feedbackType} onChange={e => setFeedbackType(e.target.value)}
+                sx={{ color: '#fff', '& .MuiOutlinedInput-notchedOutline': { borderColor: '#444' } }}>
+                {FEEDBACK_TYPES.map(t => <MenuItem key={t} value={t}>{t}</MenuItem>)}
+              </Select>
+              <TextField multiline minRows={4} placeholder="What's on your mind?" value={feedbackText}
+                onChange={e => setFeedbackText(e.target.value)} sx={inputDarkSx} />
+              {feedbackError && <Alert severity="error">{feedbackError}</Alert>}
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFeedbackOpen(false)} sx={{ color: DARK.textSecondary, textTransform: 'none' }}>
+            {feedbackSent ? 'Close' : 'Cancel'}
+          </Button>
+          {!feedbackSent && (
+            <Button onClick={submitFeedbackForm} disabled={feedbackSubmitting || !feedbackText.trim()}
+              sx={{ backgroundColor: '#006efa', color: '#fff', textTransform: 'none', '&:hover': { backgroundColor: '#004cad' } }}>
+              {feedbackSubmitting ? <CircularProgress size={16} color="inherit" /> : 'Send'}
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

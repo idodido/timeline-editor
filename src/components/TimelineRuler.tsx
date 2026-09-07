@@ -1,4 +1,4 @@
-import React, { useCallback, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface CuePoint {
   id: string;
@@ -22,6 +22,7 @@ interface Props {
   pid?: string;
   ks?: string;
   entryId?: string;
+  showWaveform?: boolean;
 }
 
 const fmt = (s: number) => {
@@ -223,16 +224,128 @@ function SlideTrack({ segments, duration, currentTime, selectedId, onSegmentClic
   );
 }
 
+// ── Audio waveform overlay ────────────────────────────────────────────────
+
+function Waveform({ entryId, ks, duration, width }: {
+  entryId: string;
+  ks: string;
+  duration: number;
+  width: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!entryId || !ks || duration === 0 || width === 0) return;
+
+    const API = 'https://cdnapisec.kaltura.com/api_v3';
+    fetch(`${API}/service/media/action/getVolumeMap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ks, format: 1, entryId }),
+    })
+      .then(r => r.text())
+      .then(csv => {
+        // Parse CSV: skip header, get pts (ms) and rms_level (dB, -90..0)
+        const points: { t: number; db: number }[] = [];
+        csv.split('\n').slice(1).forEach(line => {
+          const [pts, rms] = line.split(',');
+          if (pts && rms) {
+            const t = parseFloat(pts);
+            const db = parseFloat(rms);
+            if (!isNaN(t) && !isNaN(db)) points.push({ t, db });
+          }
+        });
+        if (points.length === 0) return;
+
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const HEIGHT = canvas.height;
+        const ctx = canvas.getContext('2d')!;
+        ctx.clearRect(0, 0, width, HEIGHT);
+
+        // dB range: -90 (silence) to 0 (max). Map to 0..1 amplitude
+        const dbToAmp = (db: number) => Math.max(0, Math.min(1, (db + 90) / 90));
+        const durationMs = duration * 1000;
+
+        // Draw waveform as filled path from center
+        ctx.beginPath();
+        const midY = HEIGHT / 2;
+
+        points.forEach((p, i) => {
+          const x = (p.t / durationMs) * width;
+          const amp = dbToAmp(p.db);
+          const h = amp * midY;
+          if (i === 0) {
+            ctx.moveTo(x, midY - h);
+          } else {
+            ctx.lineTo(x, midY - h);
+          }
+        });
+        // Mirror bottom half
+        for (let i = points.length - 1; i >= 0; i--) {
+          const p = points[i];
+          const x = (p.t / durationMs) * width;
+          const amp = dbToAmp(p.db);
+          const h = amp * midY;
+          ctx.lineTo(x, midY + h);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0, 200, 120, 0.45)';
+        ctx.fill();
+
+        // Draw center line
+        ctx.beginPath();
+        ctx.moveTo(0, midY);
+        ctx.lineTo(width, midY);
+        ctx.strokeStyle = 'rgba(0, 200, 120, 0.2)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        setLoaded(true);
+      })
+      .catch(() => {}); // silently ignore if unavailable
+  }, [entryId, ks, duration, width]);
+
+  if (!loaded && !canvasRef.current) {
+    // pre-render canvas even before data loads
+  }
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={width}
+      height={FILM_HEIGHT}
+      style={{
+        position: 'absolute', top: 0, left: 0,
+        width: '100%', height: '100%',
+        pointerEvents: 'none', zIndex: 2,
+      }}
+    />
+  );
+}
+
 // ── Video filmstrip ───────────────────────────────────────────────────────
 
-function Filmstrip({ duration, currentTime, pid, entryId, onSeek }: {
+function Filmstrip({ duration, currentTime, pid, ks, entryId, onSeek }: {
   duration: number;
   currentTime: number;
   pid?: string;
+  ks?: string;
   entryId?: string;
   onSeek: (t: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const ro = new ResizeObserver(entries => {
+      setContainerWidth(entries[0].contentRect.width);
+    });
+    ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, []);
 
   const handleClick = useCallback((e: React.MouseEvent) => {
     if (!ref.current || duration === 0) return;
@@ -268,6 +381,10 @@ function Filmstrip({ duration, currentTime, pid, entryId, onSeek }: {
             })
           : <div style={{ flex: 1, backgroundColor: '#222' }} />
         }
+        {/* Waveform overlay — on top of thumbnails, below playhead */}
+        {duration > 0 && ks && entryId && containerWidth > 0 && (
+          <Waveform entryId={entryId} ks={ks} duration={duration} width={containerWidth} />
+        )}
         {/* Playhead */}
         {duration > 0 && <Playhead currentTime={currentTime} duration={duration} />}
       </div>
@@ -357,6 +474,7 @@ export const TimelineRuler = ({ duration, currentTime, cuePoints, selectedId, on
         duration={duration}
         currentTime={currentTime}
         pid={pid}
+        ks={ks}
         entryId={entryId}
         onSeek={onSeek}
       />

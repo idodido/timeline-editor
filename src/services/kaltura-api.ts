@@ -2,7 +2,11 @@ const API = 'https://cdnapisec.kaltura.com/api_v3';
 
 export interface KalturaConfig { pid: string; ks: string; }
 let _config: KalturaConfig = { pid: '', ks: '' };
-export const initKaltura = (config: KalturaConfig) => { _config = config; };
+export const initKaltura = (config: KalturaConfig) => {
+  _config = config;
+  // Also wire up the summary microservice KS
+  import('./summary-api').then(m => m.setSummaryKs(config.ks));
+};
 export const getConfig = () => _config;
 
 // ── Core request helper ────────────────────────────────────────────────────
