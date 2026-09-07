@@ -1,14 +1,21 @@
 const API = 'https://cdnapisec.kaltura.com/api_v3';
 
 // Feedback always goes to a fixed partner (2222), via a KS that is scoped to ONLY
-// create KalturaDataEntry objects there — see the "one-time manual setup" step in
-// the timeline-editor KMS plan. Safe to ship client-side because of that scoping,
-// not because it's secret.
-// Standalone/dev default comes from the build-time env var; an embedding host
-// (KMS) overrides both at runtime via setFeedbackConfig, since it mints/owns
-// these values itself (see the KMS module's default.ini).
+// create KalturaDataEntry objects there — verified against the live API to be
+// unable to do anything else (data.list/entry.list/user.get/session.get all
+// SERVICE_FORBIDDEN). Safe to ship — including committed to source — because of
+// that scoping, not because it's secret; deliberately the same KS everywhere
+// this app runs, so feedback always lands in one place regardless of deployment.
+// setrole:34228222 = "Timeline Editor Feedback Role" on partner 2222, which
+// grants only the TIMELINEEDITOR_FEEDBACK_DATA_ADD permission (data.add).
+const DEFAULT_FEEDBACK_KS =
+  'YzBjMmEzYjY2YjhmMmRhOGZiNGU4Zjg0YTFiMzIwYjViNmFhMWJlN3wyMjIyOzIyMjI7MjEwMzQ3OTAxODswOzE3ODgxMTkwMTguMjQwNztJZG8uQWNocmFrO3NldHJvbGU6MzQyMjgyMjI7Ow==';
+
+// An embedding host (KMS) can still override both at runtime via setFeedbackConfig,
+// since it mints/owns these values itself (see the KMS module's default.ini) — but
+// the default above is what ships in this repo and what standalone/dev usage gets.
 let FEEDBACK_PARTNER_ID = import.meta.env.VITE_FEEDBACK_PARTNER_ID ?? '2222';
-let FEEDBACK_KS = import.meta.env.VITE_FEEDBACK_KS ?? '';
+let FEEDBACK_KS = import.meta.env.VITE_FEEDBACK_KS ?? DEFAULT_FEEDBACK_KS;
 
 export const setFeedbackConfig = (ks: string, partnerId?: string) => {
   FEEDBACK_KS = ks;
